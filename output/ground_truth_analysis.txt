@@ -1,0 +1,66 @@
+GROUND TRUTH ANALYSIS
+============================================================
+
+DATASET OVERVIEW
+------------------------------------------------------------
+Row count: 2,206,821
+Columns: ['source1_entity_id', 'matched_entity_ids', 'match_count']
+Unique Source1 IDs: 2,206,821
+
+SCHEMA
+------------------------------------------------------------
+source1_entity_id: object
+matched_entity_ids: object
+match_count: int64
+
+MISSING VALUES
+------------------------------------------------------------
+source1_entity_id: 0
+matched_entity_ids: 0
+match_count: 0
+
+EMPTY VALUES
+------------------------------------------------------------
+source1_entity_id: 0
+matched_entity_ids: 123,247
+match_count: 0
+
+DUPLICATE SOURCE1 IDs
+------------------------------------------------------------
+Duplicate rows: 0
+
+MATCH DISTRIBUTION
+------------------------------------------------------------
+0 matches: 123,247
+1 match: 119,157
+2 matches: 375,212
+3+ matches: 1,589,205
+
+MATCH STATISTICS
+------------------------------------------------------------
+Total matched relationships: 7,638,365
+Mean matches per Source1: 3.4613
+Median matches per Source1: 3
+Maximum matches per Source1: 11
+
+PERCENTAGES
+------------------------------------------------------------
+0 matches: 5.58%
+1 match: 5.40%
+2 matches: 17.00%
+3+ matches: 72.01%
+
+DETAILED DISTRIBUTION
+------------------------------------------------------------
+0 matches: 123,247
+1 matches: 119,157
+2 matches: 375,212
+3 matches: 530,841
+4 matches: 484,115
+5 matches: 321,957
+6 matches: 164,868
+7 matches: 63,968
+8 matches: 18,680
+9 matches: 4,205
+10 matches: 534
+11 matches: 37
