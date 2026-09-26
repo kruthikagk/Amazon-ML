@@ -22,6 +22,11 @@ RAW_ADDRESS_COLUMN = "business_address"
 CLEAN_NAME_COLUMN = "business_name_clean"
 CLEAN_ADDRESS_COLUMN = "business_address_clean"
 TOKEN_PATTERN = re.compile(r"[^\W_]+", flags=re.UNICODE)
+PUNCTUATION_TRANSLATION = {
+    codepoint: " "
+    for codepoint in range(0, 0x110000)
+    if unicodedata.category(chr(codepoint)).startswith("P")
+}
 
 
 def _normalize_text(value: object) -> str:
@@ -29,10 +34,7 @@ def _normalize_text(value: object) -> str:
     if value is None or pd.isna(value):
         return ""
     text = unicodedata.normalize("NFKC", str(value)).casefold()
-    text = "".join(
-        " " if unicodedata.category(character).startswith("P") else character
-        for character in text
-    )
+    text = text.translate(PUNCTUATION_TRANSLATION)
     return " ".join(text.split())
 
 
@@ -51,7 +53,8 @@ def normalize_country(value: object) -> str:
 def _informative_tokens(value: str, stop_tokens: frozenset[str]) -> tuple[str, ...]:
     seen: set[str] = set()
     tokens: list[str] = []
-    for token in TOKEN_PATTERN.findall(value):
+    for match in TOKEN_PATTERN.finditer(value):
+        token = match.group(0)
         if token in stop_tokens or len(token) < 2 or token in seen:
             continue
         seen.add(token)
