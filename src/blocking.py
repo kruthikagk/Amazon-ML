@@ -6,6 +6,7 @@ import csv
 import logging
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -62,7 +63,7 @@ def _informative_tokens(value: str, stop_tokens: frozenset[str]) -> tuple[str, .
 class BlockingConfig:
     """Limits and input settings for safe, batch-oriented blocking."""
 
-    max_posting_list_size: int = 1_000
+    max_posting_list_size: int = 250
     max_candidates_per_source1_record: int = 1_000
     chunk_size: int = 100_000
     input_format: str = "parquet"
@@ -97,6 +98,7 @@ class BlockingStats:
     candidates_retained: int = 0
     candidates_skipped_limit: int = 0
     max_candidates_for_record: int = 0
+    blocking_keys_skipped: int = 0
 
     def observe_record(self, retained: int) -> None:
         self.source1_records += 1
@@ -109,18 +111,24 @@ class BlockingStats:
 
 
 class BoundedInvertedIndex:
-    """Keep only a bounded prefix for each key, including frequent keys."""
+    """Store all postings for allowed keys, never a prefix of frequent keys."""
 
     def __init__(self, max_posting_list_size: int) -> None:
         self.max_posting_list_size = max_posting_list_size
         self._postings: dict[tuple[str, str], list[TargetRecord]] = {}
+        self._allowed_keys: set[tuple[str, str]] = set()
+
+    def allow_keys(self, frequencies: Mapping[tuple[str, str], int]) -> None:
+        self._allowed_keys = {
+            key for key, frequency in frequencies.items()
+            if frequency <= self.max_posting_list_size
+        }
 
     def add(self, key: tuple[str, str], record: TargetRecord) -> None:
-        if not key[0] or not key[1]:
+        if not key[0] or not key[1] or key not in self._allowed_keys:
             return
         postings = self._postings.setdefault(key, [])
-        if len(postings) < self.max_posting_list_size:
-            postings.append(record)
+        postings.append(record)
 
     def get(self, key: tuple[str, str]) -> Sequence[TargetRecord]:
         """Return the posting list directly, avoiding a per-lookup copy."""
@@ -139,6 +147,58 @@ class BlockingIndex:
         self.exact_names = BoundedInvertedIndex(config.max_posting_list_size)
         self.name_tokens = BoundedInvertedIndex(config.max_posting_list_size)
         self.address_tokens = BoundedInvertedIndex(config.max_posting_list_size)
+        self._exact_name_frequencies: Counter[tuple[str, str]] = Counter()
+        self._name_token_frequencies: Counter[tuple[str, str]] = Counter()
+        self._address_token_frequencies: Counter[tuple[str, str]] = Counter()
+        self._frequencies_finalized = False
+
+    def _normalized_values(
+        self,
+        business_name: object,
+        business_address: object,
+        country_value: object,
+    ) -> tuple[str, str, str]:
+        return (
+            normalize_country(country_value),
+            normalize_business_name(business_name),
+            normalize_business_address(business_address),
+        )
+
+    def count_values(
+        self,
+        business_name: object,
+        business_address: object,
+        country_value: object,
+    ) -> None:
+        country, name, address = self._normalized_values(
+            business_name, business_address, country_value
+        )
+        if not country:
+            return
+        if name:
+            self._exact_name_frequencies[(country, name)] += 1
+        for token in _informative_tokens(name, self.config.stop_tokens):
+            self._name_token_frequencies[(country, token)] += 1
+        for token in _informative_tokens(address, self.config.stop_tokens):
+            self._address_token_frequencies[(country, token)] += 1
+
+    def finalize_frequencies(self) -> None:
+        self.exact_names.allow_keys(self._exact_name_frequencies)
+        self.name_tokens.allow_keys(self._name_token_frequencies)
+        self.address_tokens.allow_keys(self._address_token_frequencies)
+        self._frequencies_finalized = True
+
+    @property
+    def number_of_skipped_keys(self) -> int:
+        return sum(
+            frequency > self.config.max_posting_list_size
+            for frequencies in (
+                self._exact_name_frequencies,
+                self._name_token_frequencies,
+                self._address_token_frequencies,
+            )
+            for frequency in frequencies.values()
+        )
 
     def add_values(
         self,
@@ -151,6 +211,10 @@ class BlockingIndex:
         country = normalize_country(country_value)
         if entity_id is None or pd.isna(entity_id) or not country:
             return
+        if not self._frequencies_finalized:
+            raise RuntimeError(
+                "BlockingIndex frequencies must be finalized before adding records"
+            )
         name = normalize_business_name(business_name)
         address = normalize_business_address(business_address)
         target = TargetRecord(str(entity_id), target_source)
@@ -197,7 +261,12 @@ def build_index_from_frames(
     config: BlockingConfig | None = None,
 ) -> BlockingIndex:
     config = config or BlockingConfig(input_format="tsv")
+    target_frames = list(target_frames)
     index = BlockingIndex(config)
+    for target_source, frame in target_frames:
+        for _, name, address, country in _frame_values(frame):
+            index.count_values(name, address, country)
+    index.finalize_frequencies()
     for target_source, frame in target_frames:
         for entity_id, name, address, country in _frame_values(frame):
             index.add_values(entity_id, name, address, country, target_source)
@@ -279,6 +348,10 @@ def build_index_from_paths(
     """Build target indexes incrementally; max_target_rows is for benchmarks."""
     config = config or BlockingConfig()
     index = BlockingIndex(config)
+    for target_source, path in (("source2", source2_path), ("source3", source3_path)):
+        for _, name, address, country in _read_rows(path, config, max_target_rows):
+            index.count_values(name, address, country)
+    index.finalize_frequencies()
     for target_source, path in (("source2", source2_path), ("source3", source3_path)):
         for entity_id, name, address, country in _read_rows(path, config, max_target_rows):
             index.add_values(entity_id, name, address, country, target_source)
@@ -366,10 +439,12 @@ def _log_stats(stats: BlockingStats, config: BlockingConfig) -> None:
     logger.info(
         "Blocking complete: source1_records=%d candidates_generated=%d "
         "candidates_retained=%d candidates_skipped_limit=%d "
+        "blocking_keys_skipped=%d "
         "average_candidates_per_record=%.2f max_candidates_for_record=%d "
         "max_candidates_per_source1_record=%d",
         stats.source1_records, stats.candidates_generated, stats.candidates_retained,
-        stats.candidates_skipped_limit, stats.average_candidates_per_record,
+        stats.candidates_skipped_limit, stats.blocking_keys_skipped,
+        stats.average_candidates_per_record,
         stats.max_candidates_for_record, config.max_candidates_per_source1_record,
     )
 
@@ -394,6 +469,7 @@ def generate_candidates(
     index = build_index_from_paths(
         source2_path, source3_path, config, max_target_rows=max_target_rows
     )
+    stats.blocking_keys_skipped = index.number_of_skipped_keys
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8", newline="") as handle:
